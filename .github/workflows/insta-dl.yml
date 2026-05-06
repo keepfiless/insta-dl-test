@@ -1,0 +1,541 @@
+name: 03- 📸 Instagram Post & Reel Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      instagram_url:
+        description: 'Instagram post or reel URL'
+        required: true
+        type: string
+      password:
+        description: 'Password for zip files (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  download-instagram:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          echo "Git configured"
+
+      - name: Start WARP Container
+        run: |
+          echo "Starting Cloudflare WARP container..."
+
+          docker network create warp-net || true
+
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP to initialize (30 seconds)..."
+          sleep 30
+
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              break
+            else
+              echo "Attempt $i/10 - WARP not ready yet, waiting..."
+              sleep 10
+            fi
+          done
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip curl jq bc unzip
+          pip3 install --upgrade yt-dlp instaloader
+
+      - name: Download Instagram Content
+        run: |
+          URL="${{ github.event.inputs.instagram_url }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+
+          SPLIT_MB=45
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          BACKUP_DIR="/tmp/instagram_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+
+          mkdir -p tmp_downloads
+
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          echo "Instagram Downloader"
+          echo "URL: $URL"
+
+          # ─── Helper functions ──────────────────────────────────────────────
+
+          sanitize_name() {
+            echo "$1" \
+              | sed 's/[[:space:]]/-/g' \
+              | sed 's/[^a-zA-Z0-9._-]/-/g' \
+              | tr -s '-' \
+              | sed 's/^-//;s/-$//' \
+              | cut -c1-80
+          }
+
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          # ─── Extract shortcode from URL ────────────────────────────────────
+          # Supports: /p/CODE, /reel/CODE, /tv/CODE
+          SHORTCODE=$(echo "$URL" | grep -oP '(?<=/(?:p|reel|tv)/)[^/?]+')
+
+          if [ -z "$SHORTCODE" ]; then
+            echo "ERROR: Could not extract shortcode from URL: $URL"
+            exit 1
+          fi
+          echo "Shortcode: $SHORTCODE"
+
+          # ─── Attempt 1: yt-dlp via WARP ───────────────────────────────────
+          DOWNLOAD_SUCCESS=false
+
+          echo "Trying yt-dlp with WARP proxy..."
+          if yt-dlp \
+              --proxy "socks5://127.0.0.1:1080" \
+              --output "tmp_downloads/%(title)s.%(ext)s" \
+              --no-part \
+              --retries 10 \
+              --fragment-retries 10 \
+              --no-check-certificates \
+              --write-thumbnail \
+              "$URL" 2>&1; then
+            DOWNLOAD_SUCCESS=true
+            echo "yt-dlp (WARP) succeeded"
+          fi
+
+          # ─── Attempt 2: yt-dlp direct ─────────────────────────────────────
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "Trying yt-dlp without proxy..."
+            if yt-dlp \
+                --output "tmp_downloads/%(title)s.%(ext)s" \
+                --no-part \
+                --retries 10 \
+                --fragment-retries 10 \
+                --no-check-certificates \
+                --write-thumbnail \
+                "$URL" 2>&1; then
+              DOWNLOAD_SUCCESS=true
+              echo "yt-dlp (direct) succeeded"
+            fi
+          fi
+
+          # ─── Attempt 3: instaloader ───────────────────────────────────────
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "Trying instaloader..."
+            if instaloader \
+                --no-metadata-json \
+                --no-captions \
+                --no-compress-json \
+                --dirname-pattern "tmp_downloads" \
+                --filename-pattern "{shortcode}" \
+                --proxy "socks5://127.0.0.1:1080" \
+                -- "-${SHORTCODE}" 2>&1; then
+              DOWNLOAD_SUCCESS=true
+              echo "instaloader (WARP) succeeded"
+            fi
+          fi
+
+          # ─── Attempt 4: instaloader direct ────────────────────────────────
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "Trying instaloader without proxy..."
+            if instaloader \
+                --no-metadata-json \
+                --no-captions \
+                --no-compress-json \
+                --dirname-pattern "tmp_downloads" \
+                --filename-pattern "{shortcode}" \
+                -- "-${SHORTCODE}" 2>&1; then
+              DOWNLOAD_SUCCESS=true
+              echo "instaloader (direct) succeeded"
+            fi
+          fi
+
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "All download methods failed!"
+            exit 1
+          fi
+
+          # Clean up leftover .part files
+          find tmp_downloads -name "*.part" -delete
+
+          echo ""
+          echo "Files downloaded:"
+          ls -la tmp_downloads/
+
+          # ─── Detect content type ──────────────────────────────────────────
+          # Separate images and videos
+          VIDEO_FILES=()
+          IMAGE_FILES=()
+
+          while IFS= read -r -d '' f; do
+            case "${f##*.}" in
+              mp4|mkv|webm|mov|avi) VIDEO_FILES+=("$f") ;;
+              jpg|jpeg|png|gif|webp) IMAGE_FILES+=("$f") ;;
+            esac
+          done < <(find tmp_downloads -type f -print0)
+
+          echo "Videos found: ${#VIDEO_FILES[@]}"
+          echo "Images found: ${#IMAGE_FILES[@]}"
+
+          # ─── Build folder name ────────────────────────────────────────────
+          # Use shortcode as stable base, with timestamp
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          RAW_FOLDER_NAME="${SHORTCODE}-${TIMESTAMP}"
+          FOLDER_NAME=$(sanitize_name "$RAW_FOLDER_NAME")
+
+          # Avoid collisions
+          while [ -d "instagram/$FOLDER_NAME" ] || [ -d "$BACKUP_DIR/$FOLDER_NAME" ]; do
+            FOLDER_NAME="${FOLDER_NAME}_$RANDOM"
+          done
+
+          ITEM_BACKUP="$BACKUP_DIR/$FOLDER_NAME"
+          mkdir -p "$ITEM_BACKUP"
+          echo "Folder name: $FOLDER_NAME"
+
+          # ─── Detect post type label ───────────────────────────────────────
+          if echo "$URL" | grep -qi "reel"; then
+            POST_TYPE="Reel"
+          elif [ ${#VIDEO_FILES[@]} -gt 0 ] && [ ${#IMAGE_FILES[@]} -eq 0 ]; then
+            POST_TYPE="Video"
+          elif [ ${#IMAGE_FILES[@]} -gt 0 ] && [ ${#VIDEO_FILES[@]} -eq 0 ]; then
+            POST_TYPE="Photo"
+          else
+            POST_TYPE="Mixed"
+          fi
+
+          echo "Post type: $POST_TYPE"
+
+          # ─── Process & copy files ─────────────────────────────────────────
+          DOWNLOAD_LINKS_MD=""
+          FILE_NUM=0
+          TOTAL_SIZE=0
+
+          ALL_FILES=("${IMAGE_FILES[@]}" "${VIDEO_FILES[@]}")
+
+          for SRC_FILE in "${ALL_FILES[@]}"; do
+            [ -f "$SRC_FILE" ] || continue
+            BASENAME=$(basename "$SRC_FILE")
+            EXT="${BASENAME##*.}"
+            FILE_SIZE=$(stat -c%s "$SRC_FILE")
+            TOTAL_SIZE=$((TOTAL_SIZE + FILE_SIZE))
+
+            FILE_NUM=$((FILE_NUM + 1))
+            DEST_NAME="${FOLDER_NAME}_${FILE_NUM}.${EXT}"
+
+            if [ "$FILE_SIZE" -gt "$SPLIT_BYTES" ]; then
+              # ── Large video: split into zip parts ────────────────────────
+              echo "Splitting large file: $BASENAME ($(( FILE_SIZE / 1024 / 1024 ))MB)"
+
+              TEMP_NAME="insta_tmp_${FILE_NUM}"
+              cp "$SRC_FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+
+              cd tmp_downloads
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -0 -s "${SPLIT_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              else
+                zip -0 -s "${SPLIT_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              fi
+
+              PART_N=0
+              for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                [ -f "$part" ] || continue
+                PART_EXT="${part##*.}"
+                PART_DEST="${FOLDER_NAME}_${FILE_NUM}.${PART_EXT}"
+                mv "$part" "$ITEM_BACKUP/$PART_DEST"
+                PART_N=$((PART_N + 1))
+                PART_ENCODED=$(urlencode "$PART_DEST")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/instagram/$(urlencode "$FOLDER_NAME")/${PART_ENCODED}"
+                DOWNLOAD_LINKS_MD+="| ${PART_N} | \`${PART_DEST}\` | 🎬 Split Part | [Download](${RAW_LINK}) |"$'\n'
+              done
+
+              rm -f "tmp_downloads/${TEMP_NAME}.${EXT}"
+              cd ..
+
+            elif [ -n "$ZIP_PASSWORD" ]; then
+              # ── Password protected zip ────────────────────────────────────
+              echo "Zipping (password protected): $BASENAME"
+              ZIP_NAME="${FOLDER_NAME}_${FILE_NUM}.zip"
+              cd tmp_downloads
+              zip -j -P "$ZIP_PASSWORD" "$ZIP_NAME" "$BASENAME"
+              mv "$ZIP_NAME" "$ITEM_BACKUP/$ZIP_NAME"
+              cd ..
+
+              FILE_ENCODED=$(urlencode "$ZIP_NAME")
+              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/instagram/$(urlencode "$FOLDER_NAME")/${FILE_ENCODED}"
+              ICON="🔒"
+              case "$EXT" in mp4|mkv|webm|mov) ICON="🎬 🔒" ;; jpg|jpeg|png|gif|webp) ICON="🖼️ 🔒" ;; esac
+              DOWNLOAD_LINKS_MD+="| ${FILE_NUM} | \`${ZIP_NAME}\` | ${ICON} | [Download](${RAW_LINK}) |"$'\n'
+
+            else
+              # ── Direct copy ───────────────────────────────────────────────
+              echo "Copying: $BASENAME → $DEST_NAME"
+              cp "$SRC_FILE" "$ITEM_BACKUP/$DEST_NAME"
+
+              FILE_ENCODED=$(urlencode "$DEST_NAME")
+              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/instagram/$(urlencode "$FOLDER_NAME")/${FILE_ENCODED}"
+              ICON="📄"
+              case "$EXT" in mp4|mkv|webm|mov) ICON="🎬" ;; jpg|jpeg|png|gif|webp) ICON="🖼️" ;; esac
+              DOWNLOAD_LINKS_MD+="| ${FILE_NUM} | \`${DEST_NAME}\` | ${ICON} | [Download](${RAW_LINK}) |"$'\n'
+            fi
+          done
+
+          TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+
+          # ─── Write per-post README.md ──────────────────────────────────────
+          POST_README="$ITEM_BACKUP/README.md"
+          {
+            echo "# 📸 ${FOLDER_NAME}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Post Information"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| **Shortcode** | \`${SHORTCODE}\` |"
+            echo "| **Original Link** | [Instagram Post](${URL}) |"
+            echo "| **Type** | **${POST_TYPE}** |"
+            echo "| **Files** | **${FILE_NUM} file(s)** |"
+            echo "| **Total Size** | **${TOTAL_SIZE_MB} MB** |"
+            if [ -n "$ZIP_PASSWORD" ]; then
+              echo "| **Password Protected** | **YES** |"
+            else
+              echo "| **Password Protected** | **NO** |"
+            fi
+            echo "| **Downloaded At** | **$(date -u '+%Y-%m-%d %H:%M:%S UTC')** |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Download Links"
+            echo ""
+            echo "| # | File | Type | Link |"
+            echo "|---|------|------|------|"
+            echo -n "${DOWNLOAD_LINKS_MD}"
+            echo ""
+            echo "---"
+            echo ""
+            if echo "$DOWNLOAD_LINKS_MD" | grep -q "Split Part"; then
+              echo "## How to Extract Split Files"
+              echo ""
+              echo "1. **Download** all \`.zip\` and \`.z01\`, \`.z02\`... files"
+              echo "2. **Extract** using [7-Zip](https://www.7-zip.org/) or [WinRAR](https://www.rarlab.com/)"
+              echo "3. Open the \`.zip\` file — all parts combine automatically"
+              echo ""
+              echo "---"
+              echo ""
+            fi
+            echo "*Downloaded via GitHub Actions Instagram Downloader*"
+          } > "$POST_README"
+
+          # Save folder info for master README
+          echo "${SHORTCODE}|${FOLDER_NAME}|${POST_TYPE}|${FILE_NUM}|${TOTAL_SIZE_MB}" >> /tmp/instagram_info.txt
+
+          rm -rf tmp_downloads
+
+          echo ""
+          echo "===== Backup folder contents ====="
+          find "$BACKUP_DIR" -type f
+
+      - name: Stop WARP Container
+        if: always()
+        run: |
+          docker stop warp || true
+          docker rm warp || true
+
+      - name: Commit & Push to Repository
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+
+          echo "Syncing with remote..."
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          mkdir -p instagram
+          cp -r "$BACKUP_DIR"/* instagram/
+
+          # ─── Regenerate master instagram/README.md ─────────────────────────
+          regenerate_master_readme() {
+            MASTER="instagram/README.md"
+            {
+              echo "# 📸 Downloaded Instagram Posts & Reels"
+              echo ""
+              echo "---"
+              echo ""
+              echo "| # | Type | Post | Files | Size | Link |"
+              echo "|---|------|------|-------|------|------|"
+
+              NUM=0
+              for folder in instagram/*/; do
+                [ -d "$folder" ] || continue
+                [ -f "$folder/README.md" ] || continue
+                FNAME=$(basename "$folder")
+
+                # Parse metadata from the per-post README
+                PTYPE=$(grep -m1 "^\| \*\*Type\*\*" "$folder/README.md" | sed 's/.*\*\*\(.*\)\*\*.*/\1/' || echo "—")
+                FCOUNT=$(grep -m1 "^\| \*\*Files\*\*" "$folder/README.md" | sed 's/.*\*\*\([0-9]*\).*/\1/' || echo "—")
+                FSIZE=$(grep -m1 "^\| \*\*Total Size\*\*" "$folder/README.md" | sed 's/.*\*\*\(.*\) MB\*\*.*/\1/' || echo "—")
+
+                NUM=$((NUM + 1))
+                ICON="📄"
+                case "$PTYPE" in
+                  Reel|Video) ICON="🎬" ;;
+                  Photo) ICON="🖼️" ;;
+                  Mixed) ICON="🎞️" ;;
+                esac
+
+                FNAME_ENC=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$FNAME")
+                LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/instagram/${FNAME_ENC}"
+
+                echo "| ${NUM} | ${ICON} ${PTYPE} | \`${FNAME}\` | ${FCOUNT} | ${FSIZE} MB | [View](${LINK}) |"
+              done
+
+              echo ""
+              echo "---"
+              echo ""
+              echo "*Total: ${NUM} post(s) archived*"
+              echo ""
+              echo "*Downloaded via GitHub Actions Instagram Downloader*"
+            } > "$MASTER"
+            echo "Master README written with ${NUM} entries"
+          }
+
+          # ─── Push strategy ─────────────────────────────────────────────────
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          # Collect all files, READMEs first
+          ALL_FILES=()
+          while IFS= read -r -d '' f; do ALL_FILES+=("$f"); done \
+            < <(find instagram -name "README.md" -print0 2>/dev/null)
+          while IFS= read -r -d '' f; do ALL_FILES+=("$f"); done \
+            < <(find instagram -type f ! -name "README.md" -print0 2>/dev/null | sort -z)
+
+          TOTAL_FILES=${#ALL_FILES[@]}
+          TOTAL_SIZE=0
+          for F in "${ALL_FILES[@]}"; do
+            [ -f "$F" ] && TOTAL_SIZE=$((TOTAL_SIZE + $(stat -c%s "$F" 2>/dev/null || echo 0)))
+          done
+          TOTAL_SIZE_MB=$((TOTAL_SIZE / 1024 / 1024))
+
+          echo "Files to push: $TOTAL_FILES  |  Total: ${TOTAL_SIZE_MB}MB"
+
+          push_with_retry() {
+            local LABEL="$1"; shift
+            local FILES=("$@")
+
+            git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+            git reset --hard origin/"$BRANCH" 2>/dev/null || true
+            mkdir -p instagram
+            cp -r "$BACKUP_DIR"/* instagram/
+
+            for F in "${FILES[@]}"; do git add "$F" 2>/dev/null || true; done
+
+            if git diff --cached --quiet 2>/dev/null; then
+              echo "Nothing to commit for: $LABEL"
+              return 0
+            fi
+
+            git commit -m "[Instagram] ${LABEL} [skip ci]" --quiet
+
+            for RETRY in {1..5}; do
+              if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
+                echo "Pushed: $LABEL"
+                return 0
+              fi
+              echo "Push failed (attempt $RETRY/5), retrying..."
+              sleep $((3 + RANDOM % 7))
+              git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+              git reset --hard origin/"$BRANCH" 2>/dev/null || true
+              mkdir -p instagram
+              cp -r "$BACKUP_DIR"/* instagram/
+              for F in "${FILES[@]}"; do git add "$F" 2>/dev/null || true; done
+              if ! git diff --cached --quiet 2>/dev/null; then
+                git commit -m "[Instagram] ${LABEL} [skip ci]" --quiet
+              fi
+            done
+
+            echo "WARNING: Could not push $LABEL after 5 attempts"
+            return 1
+          }
+
+          if [ $TOTAL_SIZE_MB -lt 100 ]; then
+            # Small: push everything at once
+            regenerate_master_readme
+            ALL_FILES+=("instagram/README.md")
+            push_with_retry "Add Instagram content" "${ALL_FILES[@]}"
+          else
+            # Large: batch push (3 files at a time)
+            BATCH=()
+            BATCH_NUM=0
+            for F in "${ALL_FILES[@]}"; do
+              BATCH+=("$F")
+              if [ ${#BATCH[@]} -ge 3 ]; then
+                BATCH_NUM=$((BATCH_NUM + 1))
+                push_with_retry "Batch $BATCH_NUM" "${BATCH[@]}"
+                BATCH=()
+                sleep 2
+              fi
+            done
+            # Remaining files
+            if [ ${#BATCH[@]} -gt 0 ]; then
+              BATCH_NUM=$((BATCH_NUM + 1))
+              push_with_retry "Batch $BATCH_NUM (final)" "${BATCH[@]}"
+            fi
+
+            # Master README last
+            git fetch origin "$BRANCH" --quiet || true
+            git reset --hard origin/"$BRANCH" || true
+            mkdir -p instagram
+            cp -r "$BACKUP_DIR"/* instagram/
+            regenerate_master_readme
+            git add instagram/README.md
+            if ! git diff --cached --quiet; then
+              git commit -m "[Instagram] Update index [skip ci]" --quiet
+              for RETRY in {1..5}; do
+                timeout 60 git push origin HEAD:"$BRANCH" && break || sleep 3
+              done
+            fi
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "Done! Instagram content saved."
+          echo "========================================"
